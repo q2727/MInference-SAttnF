@@ -166,6 +166,52 @@ def _build_block_index(
     return torch.topk(p_pool, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
 
 
+def build_block_index(
+    query: torch.Tensor,     # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    key: torch.Tensor,       # [BATCH, N_HEADS, N_CTX, D_HEAD]
+    top_k: int,
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    """
+    Public helper that wraps `_build_block_index` to construct the block
+    indices for block-sparse attention. This performs index building only
+    and does not invoke any attention kernel.
+    """
+    return _build_block_index(query, key, top_k, block_size_M, block_size_N)
+
+
+def block_sparse_attention_from_index(
+    query: torch.Tensor,    # [BATCH, N_HEADS, N_CTX_PAD, D_HEAD]
+    key: torch.Tensor,      # [BATCH, N_HEADS, N_CTX_PAD, D_HEAD]
+    value: torch.Tensor,    # [BATCH, N_HEADS, N_CTX_PAD, D_HEAD]
+    seqlens: torch.Tensor,  # [BATCH]
+    block_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX_PAD, BLOCK_SIZE_M), MAX_BLOCKS_PRE_ROW]
+    context_size: int,
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    """
+    Run block-sparse attention given pre-built block indices.
+
+    All index construction (e.g. via `build_block_index`) should be done
+    before calling this wrapper; it only executes the Triton kernel.
+    """
+    head_dim = query.shape[-1]
+    sm_scale = head_dim ** -0.5
+    out = _triton_block_sparse_attention(
+        query,
+        key,
+        value,
+        seqlens,
+        block_index,
+        sm_scale,
+        block_size_M,
+        block_size_N,
+    )
+    return out[..., :context_size, :]
+
+
 def block_sparse_attention(
     query: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
     key: torch.Tensor,    # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -180,7 +226,14 @@ def block_sparse_attention(
     key = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
     value = torch.nn.functional.pad(value, [0, 0, 0, pad, 0, 0, 0, 0])
     seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
-    sm_scale = head_dim ** -0.5
     block_index = _build_block_index(query, key, top_k, block_size_N, block_size_N)
-    out = _triton_block_sparse_attention(query, key, value, seqlens, block_index, sm_scale, block_size_M, block_size_N)
-    return out[..., :context_size, :]
+    return block_sparse_attention_from_index(
+        query,
+        key,
+        value,
+        seqlens,
+        block_index,
+        context_size=context_size,
+        block_size_M=block_size_M,
+        block_size_N=block_size_N,
+    )

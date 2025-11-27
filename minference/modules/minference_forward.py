@@ -107,6 +107,58 @@ def init_minference_parameters(self):
         apply_rotary_pos_emb = getattr(import_module(model_path), "apply_rotary_pos_emb")
         self.apply_rotary_pos_emb = True
 
+
+def compute_vertical_and_slash_indices(
+    q: "torch.Tensor",
+    k: "torch.Tensor",
+    vertical_size: int,
+    slash_size: int,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """
+    Compute vertical and slash indices for MInference's mixed sparse pattern.
+
+    This helper mirrors the logic used in the original `vertical_and_slash_kernel`
+    inside `minference_prefill_kernel`, so that both the native implementation and
+    the SAttnF path can share exactly the same indexing behaviour.
+
+    Args:
+        q: Query states of shape [B, 1, L, D].
+        k: Key states of shape [B, 1, L, D].
+        vertical_size: Number of vertical tokens to keep.
+        slash_size: Number of slash (diagonal) offsets to keep.
+
+    Returns:
+        vertical_topk: Tensor of shape [B, 1, 1, NNZ_V] with selected column indices.
+        slash_idx:     Tensor of shape [B, 1, 1, NNZ_S] with selected diagonal offsets.
+    """
+    import math as _math  # local import to avoid confusing static analysis
+
+    head_dim = q.size(-1)
+    q_len = q.shape[2]
+
+    vertical_size = min(q_len, max(vertical_size, 30))
+    slash_size = min(q_len, max(slash_size, 50))
+    last_q = min(64, q_len)
+
+    qk = torch.einsum("bhmk,bhnk->bhmn", q[:, :, -last_q:, :], k) / _math.sqrt(head_dim)
+    qk[:, :, :, -last_q:] = torch.where(
+        LAST_Q_MASK[..., -last_q:, -last_q:].to(q.device),
+        qk[:, :, :, -last_q:],
+        float("-inf"),
+    )
+    qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
+
+    vertical = qk.sum(-2, keepdim=True)
+    vertical[..., :30] = float("inf")
+    vertical_topk = torch.topk(vertical, vertical_size, -1).indices
+
+    slash = sum_all_diagonal_matrix(qk)[..., : -last_q + 1]
+    slash[..., -100:] = float("inf")
+    # slash_topk = slash  # not used downstream; kept for reference
+    slash_idx = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
+
+    return vertical_topk, slash_idx
+
 def sum_all_diagonal_matrix(mat: torch.tensor):
     b, h, n, m = mat.shape
     zero_mat = torch.zeros((b, h, n, n)).to(mat.device) # Zero matrix used for padding
@@ -595,40 +647,21 @@ def minference_prefill_kernel(
     q, k, v, head_id, layer_idx,
     config,
 ):
-    head_dim = q.size(-1)
-    def vertical_and_slash_kernel(q, k, v, vertical_size, slash_size):
-        vertical_size, slash_size  = min(q_len, max(vertical_size, 30)), min(q_len, max(slash_size, 50))
-        last_q = min(64, q_len)
-        qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k) / math.sqrt(head_dim)
-        qk[:, :, :, -last_q:] = torch.where(LAST_Q_MASK[...,-last_q:,-last_q:].to(q.device), qk[:, :, :, -last_q:], -torch.inf)
-        qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
-        vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
-        vertical_topk = torch.topk(vertical, vertical_size, -1).indices
-
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-100:] = torch.inf
-        slash_topk = slash
-        slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
-
-        return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
-
-    def block_sparse_kernel(q, k, v, vertical_size=None, slash_size=None):
-        topk = 100
-        return block_sparse_attention(q, k, v, topk)
-
     q_len = q.shape[2]
     ty, vertical_size, slash_size, _ = config["best_pattern"][layer_idx].get(str(head_id), ("vertical_and_slash", 1000, 6096, 1))
 
     if "minference_ratio" in config:
         vertical_size = int(vertical_size * config.get("minference_ratio", 1))
         slash_size = int(slash_size * config.get("minference_ratio", 1))
-    fc = {
-        "stream_llm": streaming_forward,
-        "vertical_and_slash": vertical_and_slash_kernel,
-        "block_sparse": block_sparse_kernel,
-    }[ty]
-    return fc(q, k, v, vertical_size, slash_size)
+    if ty == "stream_llm":
+        return streaming_forward(q, k, v, vertical_size, slash_size)
+    elif ty == "vertical_and_slash":
+        v_idx, s_idx = compute_vertical_and_slash_indices(q, k, vertical_size, slash_size)
+        return vertical_slash_sparse_attention(q, k, v, v_idx, s_idx)
+    elif ty == "block_sparse":
+        topk = 100
+        return block_sparse_attention(q, k, v, topk)
+
 
 def minference_prefill_forward(
     query_states, key_states, value_states,

@@ -7,10 +7,18 @@ import tilelang
 import tilelang.language as T
 import torch
 from transformers.cache_utils import DynamicCache
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.processing_utils import Unpack
+
+# `FlashAttentionKwargs` was introduced in newer versions of transformers.
+# When running with transformers==4.46.0 (as recommended by this repo),
+# the symbol is not available. We provide a lightweight fallback type to
+# keep runtime imports working; this is only used for type annotations.
+try:  # transformers >= 4.56
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs  # type: ignore
+except ImportError:  # transformers 4.46.x and earlier
+    from typing import Dict as FlashAttentionKwargs  # type: ignore[misc]
 
 
 def reorder_linear_weights(

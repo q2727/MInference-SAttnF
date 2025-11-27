@@ -7,6 +7,7 @@ from minference import MInference
 
 prompt = "Hello, my name is"
 
+# model_name = "Qwen/Qwen2.5-7B-Instruct-1M"
 model_name = "gradientai/Llama-3-8B-Instruct-262k"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
@@ -17,8 +18,15 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 # Patch MInference Module
+# minference_patch = MInference(
+#     attn_type="minference", model_name=model_name, kv_type="dense"
+# )
+
 minference_patch = MInference(
-    attn_type="minference", model_name=model_name, kv_type="dense"
+    attn_type="sattnf",
+    model_name=model_name,
+    kv_type="dense",
+    attn_kwargs={"sattnf_method": "minference"},
 )
 model = minference_patch(model)
 

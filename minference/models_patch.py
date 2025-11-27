@@ -11,7 +11,7 @@ from .patch import (
     new_patch,
     patch_hf,
 )
-from modules.leank import patch_leank
+from .modules.leank import patch_leank
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -96,6 +96,14 @@ class MInference:
             model.config.config_path = self.config.config_path
 
         if self.config.attn_type == "minference":
+            if not self.config.is_search:
+                with open(self.config.config_path, "r") as f:
+                    self.config.attn_kwargs.setdefault("best_pattern", json.load(f))
+            model = new_patch(model, self.config)
+        elif self.config.attn_type == "sattnf":
+            # SAttnF entry: we still reuse the offline best_pattern from the
+            # original MInference config, but let the prefill path go through
+            # the SAttnF dispatcher (see sattnf_prefill_forward).
             if not self.config.is_search:
                 with open(self.config.config_path, "r") as f:
                     self.config.attn_kwargs.setdefault("best_pattern", json.load(f))

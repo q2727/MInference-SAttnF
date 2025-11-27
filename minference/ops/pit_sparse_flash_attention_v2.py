@@ -192,6 +192,92 @@ def _triton_mixed_sparse_attention(
     return o
 
 
+def build_vertical_slash_index(
+    seqlens: torch.Tensor,   # [BATCH]
+    v_idx: torch.Tensor,     # [BATCH, N_HEADS, NNZ_V]
+    s_idx: torch.Tensor,     # [BATCH, N_HEADS, NNZ_S]
+    context_size: int,
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    """
+    Pure index builder for the vertical+slash pattern.
+
+    This helper converts token-level vertical / slash indices into the
+    block-level sparse indices required by the kernels. It does not
+    touch q/k/v or invoke any attention kernel.
+    """
+    batch_size, num_heads = v_idx.shape[:2]
+
+    v_idx = (
+        v_idx.to(torch.int32)
+        .reshape(batch_size, num_heads, -1)
+        .sort(dim=-1, descending=False)[0]
+    )
+    s_idx = (
+        s_idx.to(torch.int32)
+        .reshape(batch_size, num_heads, -1)
+        .sort(dim=-1, descending=True)[0]
+    )
+
+    return convert_vertical_slash_indexes(
+        seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N
+    )
+
+
+def vertical_slash_sparse_attention_from_index(
+    query: torch.Tensor,        # [BATCH, N_HEADS, N_CTX_PAD, D_HEAD_PAD]
+    key: torch.Tensor,          # [BATCH, N_HEADS, N_CTX_PAD, D_HEAD_PAD]
+    value: torch.Tensor,        # [BATCH, N_HEADS, N_CTX_PAD, D_HEAD_PAD]
+    seqlens: torch.Tensor,      # [BATCH]
+    block_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX_PAD, BLOCK_SIZE_M)]
+    block_offset: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX_PAD, BLOCK_SIZE_M), NNZ_S]
+    column_count: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX_PAD, BLOCK_SIZE_M)]
+    column_index: torch.Tensor,  # [BATCH, N_HEADS, cdiv(N_CTX_PAD, BLOCK_SIZE_M), NNZ_V]
+    context_size: int,
+    head_dim: int,
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
+    """
+    Run the vertical+slash attention given pre-built block indices.
+
+    All index construction should be done ahead of time (e.g. via
+    `build_vertical_slash_index`); this wrapper only executes kernels.
+    """
+    sm_scale = head_dim ** -0.5
+
+    if sparse_attn_func is not None:
+        out = sparse_attn_func(
+            query.transpose(1, 2).contiguous(),
+            key.transpose(1, 2).contiguous(),
+            value.transpose(1, 2).contiguous(),
+            block_count,
+            block_offset,
+            column_count,
+            column_index,
+            return_softmax_lse=False,
+            causal=True,
+        ).transpose(1, 2).contiguous()
+    else:
+        out = _triton_mixed_sparse_attention(
+            query,
+            key,
+            value,
+            seqlens,
+            block_count,
+            block_offset,
+            column_count,
+            column_index,
+            sm_scale,
+            block_size_M,
+            block_size_N,
+        )
+
+    # Remove any padding on the sequence and head dimensions.
+    return out[..., :context_size, :head_dim]
+
+
 def vertical_slash_sparse_attention(
     query: torch.Tensor,  # [BATCH, N_HEADS, N_CTX, D_HEAD]
     key: torch.Tensor,    # [BATCH, N_HEADS, N_CTX, D_HEAD]
@@ -214,34 +300,41 @@ def vertical_slash_sparse_attention(
         query = torch.nn.functional.pad(query, [0, target_dim, 0, 0, 0, 0, 0, 0])
         key = torch.nn.functional.pad(key, [0, target_dim, 0, 0, 0, 0, 0, 0])
         value = torch.nn.functional.pad(value, [0, target_dim, 0, 0, 0, 0, 0, 0])
-
-    v_idx = v_idx.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=False)[0]
-    s_idx = s_idx.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
     seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
-    sm_scale = head_dim ** -0.5
-    block_count, block_offset, column_count, column_index = convert_vertical_slash_indexes(
-        seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
+    block_count, block_offset, column_count, column_index = build_vertical_slash_index(
+        seqlens,
+        v_idx,
+        s_idx,
+        context_size,
+        block_size_M,
+        block_size_N,
     )
 
-    if sparse_attn_func is not None:
-        out = sparse_attn_func(
-            query.transpose(1, 2).contiguous(),
-            key.transpose(1, 2).contiguous(),
-            value.transpose(1, 2).contiguous(),
-            block_count, block_offset, column_count, column_index,
-            return_softmax_lse=False,
-            causal=True,
-        ).transpose(1, 2).contiguous()
-    else:
-        out = _triton_mixed_sparse_attention(
-            query, key, value, seqlens,
-            block_count, block_offset, column_count, column_index,
-            sm_scale, block_size_M, block_size_N,
-        )
+    return vertical_slash_sparse_attention_from_index(
+        query,
+        key,
+        value,
+        seqlens,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        context_size=context_size,
+        head_dim=head_dim,
+        block_size_M=block_size_M,
+        block_size_N=block_size_N,
+    )
 
-    return out[..., :context_size, :head_dim]
 
-def vertical_slash_sparse_attention_wo_pad(query, key, value, v_idx, s_idx, block_size_M: int = 64, block_size_N: int = 64):
+def vertical_slash_sparse_attention_wo_pad(
+    query,
+    key,
+    value,
+    v_idx,
+    s_idx,
+    block_size_M: int = 64,
+    block_size_N: int = 64,
+):
     batch_size, num_heads, context_size, head_dim = query.shape
     seqlens = torch.tensor([context_size], dtype=torch.int32, device=query.device)
     
