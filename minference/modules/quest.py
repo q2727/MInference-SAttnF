@@ -67,6 +67,96 @@ def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
     return mask_bottom
 
 
+def build_quest_decode_mask(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    position_ids: torch.Tensor,
+    chunk_size: int,
+    token_budget: int,
+) -> torch.Tensor:
+    """
+    Build the sparse selection mask used by Quest in the decode stage.
+
+    This helper mirrors the heavy-hitter selection logic used in the
+    original `quest_decode_kernel` so that both the native path and
+    the SAttnF pipeline can share exactly the same sparsity pattern.
+    """
+    kv_seq_len = key_states.size(-2)
+    bsz, _, q_len, _ = query_states.shape
+
+    sign = (query_states > 0) + (
+        ~(query_states > 0)
+    ) * -1  # [bsz, nh, q_len, kv_seq_len]
+    if sign.size(-2) != 1:
+        sign = sign.sum(dim=-2, keepdim=True)
+    max_key = key_states * sign
+    postive_query = query_states * sign
+
+    # expend max_key to be divisible by chunk_size
+    seq_length = max_key.shape[-2]
+    padding_length = chunk_size - ((seq_length - 1) % chunk_size + 1)
+    max_key = torch.cat(
+        [
+            max_key,
+            torch.ones(
+                (max_key.shape[0], max_key.shape[1], padding_length, max_key.shape[3]),
+                device=max_key.device,
+            )
+            * torch.tensor(torch.finfo(max_key.dtype).min, device=max_key.device),
+        ],
+        dim=-2,
+    )
+
+    # chunk max_key into chunk_size tokens
+    chunk_max_key = max_key.reshape(
+        max_key.shape[0],
+        max_key.shape[1],
+        max_key.shape[2] // chunk_size,
+        chunk_size,
+        max_key.shape[3],
+    ).amax(dim=-2)
+
+    # duplicate chunk_max_key chunk_size times
+    chunk_max_key = chunk_max_key.unsqueeze(-2).repeat(1, 1, 1, chunk_size, 1)
+    # reshape chunk_max_key to the original shape
+    chunk_max_key = chunk_max_key.reshape(
+        chunk_max_key.shape[0], chunk_max_key.shape[1], -1, chunk_max_key.shape[-1]
+    )[:, :, :seq_length, :]
+
+    quantized_weight = torch.matmul(
+        postive_query.float(), chunk_max_key.transpose(2, 3)
+    )  # [bsz, nh, q_len, kv_seq_len]
+
+    if attention_mask is not None:
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+        quantized_weight = quantized_weight + attention_mask
+        quantized_weight = torch.max(
+            quantized_weight,
+            torch.tensor(
+                torch.finfo(quantized_weight.dtype).min,
+                device=quantized_weight.device,
+            ),
+        )
+
+    token_budget = min(kv_seq_len, token_budget)
+    attn_weights_for_selection = quantized_weight
+
+    if token_budget > 0:
+        mask_bottom = local_heavy_hitter_mask(
+            attn_weights_for_selection, token_budget, chunk_size
+        )  # Default: No padding applied to input
+    else:
+        mask_bottom = torch.zeros_like(attn_weights_for_selection, dtype=torch.bool)
+
+    # Attention mask for multi-stage Q&A / causal structure.
+    mask_bottom = torch.tril(mask_bottom, diagonal=position_ids[0][0].item())
+    return mask_bottom
+
+
 def quest_forward(
     self,
     hidden_states: torch.Tensor,
@@ -239,52 +329,21 @@ def quest_decode_kernel(
     kv_seq_len = key_states.size(-2)
     bsz, _, q_len, _ = query_states.shape
 
+    # Build the Quest sparsity mask using the shared helper, then apply
+    # it to the dense attention scores. This keeps the behaviour identical
+    # to the original implementation while making the mask construction
+    # reusable by SAttnF.
+    mask_bottom = build_quest_decode_mask(
+        query_states,
+        key_states,
+        attention_mask,
+        position_ids,
+        chunk_size,
+        token_budget,
+    )
+
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
         query_states.size(-1)
-    )
-
-    sign = (query_states > 0) + (
-        ~(query_states > 0)
-    ) * -1  # [bsz, nh, q_len, kv_seq_len]
-    if sign.size(-2) != 1:
-        sign = sign.sum(dim=-2, keepdim=True)
-    max_key = key_states * sign
-    postive_query = query_states * sign
-
-    # expend max_key to be divisible by chunk_size
-    seq_length = max_key.shape[-2]
-    padding_length = chunk_size - ((seq_length - 1) % chunk_size + 1)
-    max_key = torch.cat(
-        [
-            max_key,
-            torch.ones(
-                (max_key.shape[0], max_key.shape[1], padding_length, max_key.shape[3]),
-                device=max_key.device,
-            )
-            * torch.tensor(torch.finfo(max_key.dtype).min),
-        ],
-        dim=-2,
-    )
-
-    # chunk max_key into chunk_size tokens
-    chunk_max_key = max_key.reshape(
-        max_key.shape[0],
-        max_key.shape[1],
-        max_key.shape[2] // chunk_size,
-        chunk_size,
-        max_key.shape[3],
-    ).amax(dim=-2)
-
-    # duplicate chunk_max_key chunk_size times
-    chunk_max_key = chunk_max_key.unsqueeze(-2).repeat(1, 1, 1, chunk_size, 1)
-    # reshape chunk_max_key to the original shape
-    chunk_max_key = chunk_max_key.reshape(
-        chunk_max_key.shape[0], chunk_max_key.shape[1], -1, chunk_max_key.shape[-1]
-    )[:, :, :seq_length, :]
-
-    quantized_weight = torch.matmul(  # [bsz, nh, q_len, kv_seq_len]
-        postive_query.float(),
-        chunk_max_key.transpose(2, 3),
     )
 
     if attention_mask is not None:
@@ -294,25 +353,13 @@ def quest_decode_kernel(
             )
         attn_weights = attn_weights + attention_mask
         attn_weights = torch.max(
-            attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
+            attn_weights,
+            torch.tensor(
+                torch.finfo(attn_weights.dtype).min, device=attn_weights.device
+            ),
         )
-        quantized_weight = quantized_weight + attention_mask
-        quantized_weight = torch.max(
-            quantized_weight, torch.tensor(torch.finfo(quantized_weight.dtype).min)
-        )
 
-    token_budget = min(kv_seq_len, token_budget)
-    attn_weights_for_selection = quantized_weight
-
-    if token_budget > 0:
-        mask_bottom = local_heavy_hitter_mask(
-            attn_weights_for_selection, token_budget, chunk_size
-        )  # Default: No padding applied to input
-    else:
-        mask_bottom = torch.zeros_like(attn_weights_for_selection, dtype=torch.bool)
-
-    mask_bottom = torch.tril(mask_bottom, diagonal=position_ids[0][0].item())
-    attn_weights[~mask_bottom] = torch.tensor(torch.finfo(attn_weights.dtype).min)
+    attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
 
     # upcast attention to fp32
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(

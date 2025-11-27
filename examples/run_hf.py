@@ -19,14 +19,19 @@ model = AutoModelForCausalLM.from_pretrained(
 
 # Patch MInference Module
 # minference_patch = MInference(
-#     attn_type="minference", model_name=model_name, kv_type="dense"
+#     attn_type="minference", model_name=model_name, kv_type="quest"
 # )
 
 minference_patch = MInference(
     attn_type="sattnf",
     model_name=model_name,
-    kv_type="dense",
-    attn_kwargs={"sattnf_method": "minference"},
+    kv_type="sattnf",
+    attn_kwargs={
+        "sattnf_method": "minference",
+        "decode_sattnf_method": "quest",
+        "chunk_size": 16,
+        "token_budget": 1024,
+    },
 )
 model = minference_patch(model)
 

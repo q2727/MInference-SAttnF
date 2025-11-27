@@ -13,6 +13,7 @@ from .minference_impl import (
     MinferenceKernelExecutor,
     MinferencePattern,
 )
+from .quest_impl import QuestIndexBuilder, QuestKernelExecutor, QuestPattern
 from .base import (
     IndexBuilder,
     KernelExecutor,
@@ -131,6 +132,18 @@ class SAttnFDispatcher:
             ),
         )
 
+        # Quest: decode-time sparse attention based on heavy-hitter
+        # selection over the cached KV. Prefill remains dense; the
+        # SAttnF integration currently only targets the decode stage.
+        self.register_method(
+            "quest",
+            SAttnFMethod(
+                pattern=QuestPattern(),
+                index_builder=QuestIndexBuilder(),
+                kernel=QuestKernelExecutor(),
+            ),
+        )
+
         def _flexprefill_kernel(q, k, v, stage: str, cfg: Dict[str, Any]) -> torch.Tensor:
             if stage != "prefill":
                 raise NotImplementedError(
@@ -216,18 +229,16 @@ def sattnf_decoding_forward(
     v: torch.Tensor,
     decoding_kwargs: Dict[str, Any],
 ) -> torch.Tensor:
-    """
-    Optional decoding entry point for future extensions.
-
-    For now this raises NotImplementedError to avoid silently changing
-    existing decoding behaviour; it can be wired up method-by-method
-    when needed.
-    """
-
     dispatcher = get_sattnf_dispatcher()
     cfg = {
         "layer_idx": decoding_kwargs.get("layer_idx", 0),
         "attn_forward_config": decoding_kwargs.get("attn_forward_config", {}),
+        "attention_mask": decoding_kwargs.get("attention_mask"),
+        "position_ids": decoding_kwargs.get("position_ids"),
+        "num_key_value_groups": decoding_kwargs.get("num_key_value_groups", 1),
     }
-    method_name = cfg["attn_forward_config"].get("sattnf_method", "minference")
+    method_name = cfg["attn_forward_config"].get(
+        "decode_sattnf_method",
+        cfg["attn_forward_config"].get("sattnf_method", "minference"),
+    )
     return dispatcher.run_decode(method_name, q, k, v, cfg)

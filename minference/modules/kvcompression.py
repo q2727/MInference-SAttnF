@@ -453,6 +453,9 @@ class DynamicCacheWithRepeat(DynamicCache):
 method_to_cache_obj = {
     "": DynamicCacheWithRepeat,
     "dense": DynamicCacheWithRepeat,
+    # SAttnF decode currently uses the standard dynamic cache and
+    # delegates sparsity to the SAttnF dispatcher.
+    "sattnf": DynamicCacheWithRepeat,
     "snapkv": SnapKVCache,
     "pyramidkv": PyramidKVCache,
     "streamingllm": StreamingLLMKVCache,

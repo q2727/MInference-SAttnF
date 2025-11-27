@@ -16,7 +16,7 @@ from ..modules.quest import quest_decode_kernel
 from ..modules.retr_attn import retr_attn
 from ..modules.tri_mix import tri_mix_forward, tri_mix_minference_forward
 from ..modules.xattention import xattention_forward
-from ..sattnf.router import sattnf_prefill_forward
+from ..sattnf.router import sattnf_prefill_forward, sattnf_decoding_forward
 from ..ops.streaming_kernel import a_shape_kernel, tri_shape_kernel
 
 
@@ -256,7 +256,8 @@ decoding_forwards = {
     "retr_attn": retr_attn,
     "kivi": kivi_forward,
     "leank": leank_forward,
-    # For SAttnF we currently only route the prefilling stage through
-    # the unified pipeline. Decoding falls back to the dense path.
-    "sattnf": None,
+    # When kv_type == "sattnf", decoding is routed through the unified
+    # SAttnF pipeline (see `sattnf_decoding_forward`), and the concrete
+    # method is selected via `attn_forward_config`.
+    "sattnf": sattnf_decoding_forward,
 }

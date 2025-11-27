@@ -40,6 +40,10 @@ class MInferenceConfig:
         "retr_attn",
         "kivi",
         "leank",
+        # Route decoding through the SAttnF pipeline. The concrete
+        # decode method is selected via `attn_forward_config`, e.g.
+        # `decode_sattnf_method: "quest"`.
+        "sattnf",
     ]
 
     def __init__(
