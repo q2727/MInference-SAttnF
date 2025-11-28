@@ -8,6 +8,8 @@ class MInferenceConfig:
     MINFERENCE_ATTENTION_TYPES = [
         "minference",
         "vllm_minference",
+        # vLLM + SAttnF entry point (prefill routed via SAttnF dispatcher)
+        "vllm_sattnf",
         "tri_mix_minference",
         # SAttnF entry point (prefill routed via sattnf dispatcher)
         "sattnf",

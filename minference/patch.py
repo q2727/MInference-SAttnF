@@ -1068,15 +1068,24 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
         gather_last_q_vertical_slash_topk_vllm,
         minference_vllm_forward,
     )
+    from minference.sattnf.vllm_impl import sattnf_vllm_forward
 
     vllm_version = vllm.__version__
 
     config = defaultdict(dict)
     if os.path.exists(config_file):
         config = json.load(open(config_file))
-    attn_forward = minference_vllm_forward(
-        config, vllm_version=vllm_version, patch_config=patch_config
-    )
+
+    # Select either the native Minference-vLLM integration or the
+    # generic SAttnF-vLLM forward based on the patch configuration.
+    if patch_config.get("sattnf", False):
+        attn_forward = sattnf_vllm_forward(
+            config, vllm_version=vllm_version, patch_config=patch_config
+        )
+    else:
+        attn_forward = minference_vllm_forward(
+            config, vllm_version=vllm_version, patch_config=patch_config
+        )
 
     def vllm_attn_forward(
         self,

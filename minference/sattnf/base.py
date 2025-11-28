@@ -85,6 +85,41 @@ class KernelExecutor:
         raise NotImplementedError
 
 
+class PatternObserver:
+    """
+    Optional observer interface that can be used to collect statistics
+    about the sparse pattern and kernel behaviour without changing the
+    core pipeline logic.
+
+    Typical use cases include measuring attention recall, sparsity
+    distributions, or stability across steps/layers. Implementations
+    should avoid mutating q/k/v/index to keep behaviour unchanged.
+    """
+
+    def on_index_built(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index: SparseIndex,
+        stage: str,
+        config: Dict[str, Any],
+    ) -> None:
+        return None
+
+    def on_kernel_run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index: SparseIndex,
+        stage: str,
+        config: Dict[str, Any],
+        output: torch.Tensor,
+    ) -> None:
+        return None
+
+
 class NoOpPattern(Pattern):
     """
     Default pattern generator that does not impose any sparsity.
@@ -144,4 +179,3 @@ class PassthroughKernel(KernelExecutor):
         config: Dict[str, Any],
     ) -> torch.Tensor:
         return self.fn(q, k, v, stage, config)
-

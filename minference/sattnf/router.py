@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import torch
 
@@ -21,6 +21,7 @@ from .base import (
     NoOpPattern,
     PassthroughKernel,
     Pattern,
+    PatternObserver,
     SparseIndex,
 )
 
@@ -30,11 +31,15 @@ class SAttnFMethod:
     """
     A concrete sparse-attention method expressed as a triple:
       Pattern -> IndexBuilder -> KernelExecutor
+
+    An optional PatternObserver can be attached to collect statistics
+    (e.g., attention recall) without changing the pipeline semantics.
     """
 
     pattern: Pattern
     index_builder: IndexBuilder
     kernel: KernelExecutor
+    observer: Optional[PatternObserver] = None
 
     def run_prefill(
         self,
@@ -47,7 +52,12 @@ class SAttnFMethod:
         stage = "prefill"
         pattern_out = self.pattern.generate(q, k, v, stage, config)
         index = self.index_builder.build(pattern_out, q, k, v, stage, config)
-        return self.kernel.run(q, k, v, index, stage, config)
+        if self.observer is not None:
+            self.observer.on_index_built(q, k, v, index, stage, config)
+        out = self.kernel.run(q, k, v, index, stage, config)
+        if self.observer is not None:
+            self.observer.on_kernel_run(q, k, v, index, stage, config, out)
+        return out
 
     def run_decode(
         self,
@@ -59,7 +69,12 @@ class SAttnFMethod:
         stage = "decode"
         pattern_out = self.pattern.generate(q, k, v, stage, config)
         index = self.index_builder.build(pattern_out, q, k, v, stage, config)
-        return self.kernel.run(q, k, v, index, stage, config)
+        if self.observer is not None:
+            self.observer.on_index_built(q, k, v, index, stage, config)
+        out = self.kernel.run(q, k, v, index, stage, config)
+        if self.observer is not None:
+            self.observer.on_kernel_run(q, k, v, index, stage, config, out)
+        return out
 
 
 class SAttnFDispatcher:
@@ -113,6 +128,18 @@ class SAttnFDispatcher:
         if name in self._methods:
             raise ValueError(f"SAttnF method '{name}' already registered.")
         self._methods[name] = method
+
+    def set_observer(self, name: str, observer: Optional[PatternObserver]) -> None:
+        """
+        Attach or replace a PatternObserver for a registered method.
+
+        This allows users to collect statistics (e.g., attention recall)
+        without changing the core pipeline or re-registering methods.
+        """
+        method = self._methods.get(name)
+        if method is None:
+            raise ValueError(f"SAttnF method '{name}' is not registered.")
+        method.observer = observer
 
     def _register_builtin_methods(self) -> None:
         """

@@ -180,6 +180,22 @@ class MInference:
             model = minference_patch_vllm(
                 model, self.config.config_path, self.config.attn_kwargs
             )
+        elif self.config.attn_type == "vllm_sattnf":
+            # vLLM + SAttnF entry. We reuse the offline pattern config
+            # from the original Minference setup, but route the prefill
+            # stage through the SAttnF dispatcher inside vLLM.
+            patch_config = {
+                "sattnf": True,
+                # Allow users to select the SAttnF method, defaulting
+                # to Minference for now.
+                "sattnf_method": self.config.attn_kwargs.get(
+                    "sattnf_method", "minference"
+                ),
+                **self.config.attn_kwargs,
+            }
+            model = minference_patch_vllm(
+                model, self.config.config_path, patch_config
+            )
         elif self.config.attn_type == "vllm_flexprefill":
             patch_config = {
                 "flexprefill": True,
